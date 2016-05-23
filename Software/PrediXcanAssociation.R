@@ -1,6 +1,17 @@
 #!/usr/bin/env Rscript
 options(digits.secs=6)
 
+#install the packages if they are not installed already
+if(!(require(data.table) & c(require(foreach) & require(doParallel)))) {
+  print("Installing the required pacckages")
+  install.packages(c("data.table","doParallel","foreach"), 
+                   repos = "http://cran.us.r-project.org")
+}
+#loading required packages
+library(data.table)
+library(foreach)
+library(doParallel)
+
 read_pheno <- function(pheno_file) {
   pheno <- read.table(pheno_file, header = F, as.is = T)
   # Fix dataframe if there is a header row. Returned df will have apropos column names
@@ -9,6 +20,15 @@ read_pheno <- function(pheno_file) {
     pheno <- pheno[-1,]
   }
   return(pheno)
+}
+read_cov <- function(cov_file){
+	cov <- read.table(cov_file, header = TRUE)
+	if ("FID" %in% names(cov) & "IID" %in% names(cov)){
+	return(cov)
+	} else {
+	print("FID and IID not present in the covariate file")
+	stop()
+	}
 }
 
 reduce_pheno <- function(pheno, pheno_name = colnames(pheno)[ncol(pheno)]) {
@@ -19,7 +39,7 @@ reduce_pheno <- function(pheno, pheno_name = colnames(pheno)[ncol(pheno)]) {
   } else {
     pheno <- pheno[c(1, 2, ncol(pheno))]
   }
-  names(pheno) <- c("fid", "iid", "phenotype")
+  names(pheno) <- c("FID", "IID", "phenotype")
   pheno$phenotype <- as.numeric(pheno$phenotype)
   return(pheno)
 }
@@ -33,12 +53,13 @@ read_filter <- function(filter_file, filter_column = 3) {
   }
   # Only keep columns of filter file necessary
   fil <- fil[c(1, 2, filter_column)]
-  names(fil) <- c("fid", "iid", "fil_val")
+  names(fil) <- c("FID", "IID", "fil_val")
   return(fil)
 }
     
 read_predicted <- function(pred_exp_file) {
-  pred_exp <- read.table(pred_exp_file, header = T, as.is = T)
+  #this will be a big data frame and so fread (instead of read.table) is a better choice
+  pred_exp <- fread(pred_exp_file, header = T)
   return(pred_exp)
 }
 
@@ -65,9 +86,8 @@ merge_and_filter <- function(pheno, pred_exp, fil = NULL, filter_val = 1) {
   return(merged)
 }
 
-association <- function(merged, genes, test_type = "linear") {
+association <- function(merged, genes, test.type = "linear") {
   assoc_df <- NULL # Init association dataframe
-
   # Perform test between each pred_gene_exp column and phenotype
   for (gene in genes) {
     pred_gene_exp <- merged[[gene]]
@@ -94,6 +114,35 @@ association <- function(merged, genes, test_type = "linear") {
   }
   return(as.data.frame(assoc_df))
 }
+
+association.fun <- function(gene){
+  pred_gene_exp <- merged[[gene]]
+  if (is_cov) {
+  fml <- as.formula(paste("phenotype ~ pred_gene_exp + " , paste(cov.names,collapse = "+")))	
+  } else {
+  fml <- as.formula(paste("phenotype ~ pred_gene_exp"))
+  }
+  if (test_type == "logistic"){
+    res <- coef(summary(glm(fml, data = merged, family = binomial))) #res is a matrix
+  } else {
+    res <- coef(summary(lm(fml, data = merged))) #res is a matrix
+  }
+  return (c(gene = gene,unlist(res["pred_gene_exp",])))
+}
+
+
+#variables merged, genes, test_type should be defined in the global environment 
+association.loop = function(nthread = 1){ 
+  cat("Performing ",test_type,"regression on the predicted gene expressions")
+  cat("No. of parallel threads :", nthread,"\n")
+  registerDoParallel(nthread)
+  res.df = foreach(gene = genes,
+          .combine = rbind,
+	  .errorhandling = 'remove') %dopar%
+    association.fun(gene)
+  return(res.df)
+  }
+
 
 write_association <- function(assoc_df, output_file) {
   write.table(assoc_df, output_file, col.names = T, row.names = F, quote = F)
@@ -145,12 +194,20 @@ if (is.null(argv$FILTER_VAL)) {
 if (is.null(argv$TEST_TYPE)) {
   argv$TEST_TYPE <- "linear"
 }
+# Default IS_COV: False
+if(is.null(argv$IS_COV)){
+argv$IS_COV <- FALSE
+}
+test_type <- argv$TEST_TYPE #test_type should be declared in the global environment 
+
 # Default MISSING_PHENOTYPE: NA
 if (is.null(argv$MISSING_PHENOTYPE)) {
   argv$MISSING_PHENOTYPE <- NA
 } else {
   argv$MISSING_PHENOTYPE <- suppressWarnings(as.numeric(argv$MISSING_PHENOTYPE))
 }
+
+argv$NTHREAD = as.numeric(argv$NTHREAD)
 
 # Run functions----------------------------------------------------------------
 # Read pheno-------------------------------------------------------------------
@@ -187,6 +244,18 @@ genes <- colnames(pred_exp)[c(-1, -2)] # First 2 cols are FID and IID
 
 cat(c(as.character(Sys.time()), "Processing data...\n"))
 merged <- merge_and_filter(pheno, pred_exp, fil = fil_df, filter_val = argv$FILTER_VAL)
+
+# Read covariate file and merge -----------------------------------------------------------
+if (argv$COV_FILE == 'None' | is.null(argv$COV_FILE)){
+      is_cov = FALSE
+    } else {
+	is_cov = TRUE 
+	cov_file <- read_cov(argv$COV_FILE)
+       merged <- merge(cov_file,merged, by = c(1,2), sort = FALSE)  
+       cov.names = names(cov_file)[3:ncol(cov_file)]
+}
+
+
 # Remove rows with missing phenotype data
 if (is.na(argv$MISSING_PHENOTYPE)) {
   merged <- merged[which(!is.na(merged$phenotype)), ]
@@ -208,7 +277,7 @@ if (argv$TEST_TYPE == 'logistic' & length(table(merged$phenotype)) > 2) {
 
 # Association Tests------------------------------------------------------------
 cat(c(as.character(Sys.time()), "Performing association test...\n"))
-assoc_df <- association(merged, genes, test_type = argv$TEST_TYPE)
+assoc_df <- association.loop(nthread = argv$NTHREAD)
 cat(c(as.character(Sys.time()), "Writing results to file...\n"))
 write_association(assoc_df, argv$OUT)
 cat(c(as.character(Sys.time()), "Done. Results saved in", argv$OUT, "\n"))
